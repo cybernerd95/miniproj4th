@@ -1,0 +1,6 @@
+path: C:\Users\adity\OneDrive\Documents\Object Detect\weapon detection.v2i.yolov8 # change this to your dataset root
+train: train/images
+val: valid/images
+
+names:
+  0: weapon  # Add more class names if you have more

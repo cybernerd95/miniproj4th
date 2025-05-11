@@ -1,0 +1,10 @@
+path: ../datasets/roboflow
+
+train: train/images
+val: valid/images
+test: test/images
+
+names: 
+  0: 1
+  1: knife
+  2: pistol
