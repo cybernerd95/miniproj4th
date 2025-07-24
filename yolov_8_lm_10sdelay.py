@@ -7,6 +7,9 @@ from typing import List, Optional, Tuple, Dict, Deque
 from collections import deque
 import time
 import math
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+import os
 
 @dataclass
 class SimplifiedHandLandmarks:
@@ -41,15 +44,19 @@ class PersonData:
     left_hand_speed: BodyPartSpeed = field(default_factory=BodyPartSpeed)
     right_hand_speed: BodyPartSpeed = field(default_factory=BodyPartSpeed)
     
+    # Body part speeds
+    limb_speeds: Dict[str, float] = field(default_factory=dict)
+    
     # Previous positions
     prev_center: Optional[Tuple[float, float]] = None
     prev_left_hand: Optional[Tuple[float, float]] = None
     prev_right_hand: Optional[Tuple[float, float]] = None
+    prev_pose_landmarks: Optional[List[Tuple[float, float]]] = None
     
     # Position history (for trajectory analysis)
-    center_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=10))
-    left_hand_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=10))
-    right_hand_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=10))
+    center_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=20))  # Increased from 10
+    left_hand_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=20))  # Increased from 10
+    right_hand_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=20))  # Increased from 10
     
     # Timestamps
     timestamp: float = field(default_factory=time.time)
@@ -63,7 +70,14 @@ class PersonData:
     
     # Time tracking for persistent status
     status_start_time: float = 0  # When the assault/victim status started
+    # Action recognition
+    pose_history: Deque[List[Tuple[float, float]]] = field(default_factory=lambda: deque(maxlen=30))  # Increased from 20
+    detected_action: str = "None"
+    action_confidence: float = 0.0
     
+    # Frame tracking (for cleanup)
+    missing_frames: int = 0
+
     def update_timestamp(self):
         """Update timestamps for speed calculation"""
         self.prev_timestamp = self.timestamp
@@ -76,7 +90,9 @@ class PersonData:
 
 class AssaultDetector:
     def __init__(self, yolo_model_size="n", min_detection_confidence=0.5, 
-                 speed_threshold=100, interaction_threshold=50):
+                speed_threshold=80, interaction_threshold=50,
+                action_model_path=None,
+                action_threshold=0.65):
         """
         Initialize detector for person detection with assault detection capabilities
         
@@ -85,13 +101,76 @@ class AssaultDetector:
             min_detection_confidence (float): Confidence threshold for detection
             speed_threshold (float): Threshold for high-speed movement (pixels/second)
             interaction_threshold (float): Distance threshold for interaction detection (pixels)
+            action_model_path (str): Path to action recognition model file
+            action_threshold (float): Threshold for action recognition confidence
         """
         self.conf_threshold = min_detection_confidence
         self.speed_threshold = speed_threshold
         self.interaction_threshold = interaction_threshold
+        self.action_threshold = action_threshold
+
+        # Find H5 file in current directory if not specified
+        if action_model_path is None:
+            h5_files = [f for f in os.listdir('.') if f.endswith('.h5')]
+            if h5_files:
+                action_model_path = h5_files[0]
+                print(f"Found model file: {action_model_path}")
+            else:
+                print("No H5 model file found in current directory")
+                action_model_path = "action_model.h5"  # Default fallback
+
+        # Load the action recognition model
+        try:
+            self.action_model = load_model(action_model_path)
+            self.action_model_loaded = True
+            print(f"Action recognition model loaded from {action_model_path}")
+            # Get output shape to determine number of action classes
+            output_shape = self.action_model.outputs[0].shape
+            self.num_action_classes = output_shape[-1]
+            print(f"Model predicts {self.num_action_classes} action classes")
+            
+            # Try to find class names file (same name as model but with _classes.txt)
+            class_file = action_model_path.replace('.h5', '_classes.txt')
+            if os.path.exists(class_file):
+                with open(class_file, 'r') as f:
+                    self.action_classes = [line.strip() for line in f.readlines()]
+                print(f"Loaded {len(self.action_classes)} action classes from {class_file}")
+            else:
+                # Default action classes
+                self.action_classes = ["Normal", "Punch", "Kick", "Push", "Slap", "Other"]
+                if self.num_action_classes != len(self.action_classes):
+                    # Generate generic class names based on model output
+                    self.action_classes = [f"Action_{i}" for i in range(self.num_action_classes)]
+                print(f"Using default action classes: {self.action_classes}")
+        except Exception as e:
+            print(f"Error loading action model: {e}")
+            print("Will run without action recognition")
+            self.action_model_loaded = False
+            self.action_classes = ["Normal", "Punch", "Kick", "Push", "Slap", "Other"]
+
+        # Sequence length for action recognition model - try to determine from model input shape
+        try:
+            if self.action_model_loaded:
+                input_shape = self.action_model.inputs[0].shape
+                if len(input_shape) >= 2 and input_shape[1] is not None:
+                    self.sequence_length = input_shape[1] 
+                    print(f"Detected sequence length: {self.sequence_length}")
+                else:
+                    self.sequence_length = 10  # Default
+            else:
+                self.sequence_length = 10
+        except:
+            self.sequence_length = 10  # Default if can't determine
+            
+        print(f"Using sequence length: {self.sequence_length}")
         
         # Initialize YOLOv8 for person detection
-        self.yolo_model = YOLO(f"yolov8{yolo_model_size}.pt")
+        try:
+            self.yolo_model = YOLO(f"yolov8{yolo_model_size}.pt")
+            print(f"YOLOv8 model loaded: yolov8{yolo_model_size}.pt")
+        except Exception as e:
+            print(f"Error loading YOLO model: {e}")
+            raise ValueError("Failed to load YOLO model. Please check the model path.")
         
         # Initialize MediaPipe Holistic for body and hand landmarks
         self.mp_holistic = mp.solutions.holistic
@@ -131,6 +210,15 @@ class AssaultDetector:
             28   # right ankle
         ]
         
+        # Define body part pairs for speed calculation
+        self.limb_pairs = {
+            "left_arm": (11, 15),    # left shoulder (landmark 11) to left wrist (landmark 15)
+            "right_arm": (12, 16),   # right shoulder (landmark 12) to right wrist (landmark 16)
+            "left_leg": (23, 27),    # left hip (landmark 23) to left ankle (landmark 27)
+            "right_leg": (24, 28),   # right hip (landmark 24) to right ankle (landmark 28)
+            "torso": (0, 24),        # nose (landmark 0) to right hip (landmark 24)
+        } 
+        
         # Person tracking
         self.next_person_id = 0
         self.tracked_persons = {}  # Dictionary to track persons across frames
@@ -150,6 +238,9 @@ class AssaultDetector:
         # Frame timing
         self.prev_frame_time = time.time()
         self.curr_frame_time = time.time()
+        
+        # Frame processing capacity
+        self.max_frames_to_process = 30  # Increased from default
     
     def _extract_simplified_hand_landmarks(self, hand_landmarks):
         """Extract only the specified key points from hand landmarks"""
@@ -293,6 +384,66 @@ class AssaultDetector:
         
         return assignments
     
+    def calculate_body_part_speeds(self, person):
+        """Calculate speeds of individual body parts relative to body center"""
+        if not person.pose_landmarks or not person.prev_pose_landmarks or not person.prev_timestamp:
+            return {}
+            
+        # Time difference
+        time_diff = person.timestamp - person.prev_timestamp
+        if time_diff <= 0:
+            return {}
+            
+        # Calculate overall body speed (center of box)
+        center = person.get_center()
+        body_speed = self.calculate_speed(center, person.prev_center, time_diff) if person.prev_center else 0
+        
+        limb_speeds = {}
+        
+        # Calculate speeds for defined limb pairs
+        for limb_name, (start_idx, end_idx) in self.limb_pairs.items():
+            # Make sure the indices exist in the landmarks
+            if (start_idx < len(self.selected_pose_keypoints) and 
+                end_idx < len(self.selected_pose_keypoints)):
+                
+                # Get current landmark indices in the selected keypoints list
+                curr_start_idx = self.selected_pose_keypoints.index(start_idx) if start_idx in self.selected_pose_keypoints else -1
+                curr_end_idx = self.selected_pose_keypoints.index(end_idx) if end_idx in self.selected_pose_keypoints else -1
+                
+                if curr_start_idx >= 0 and curr_end_idx >= 0:
+                    # Get current and previous positions
+                    curr_start = person.pose_landmarks[curr_start_idx]
+                    curr_end = person.pose_landmarks[curr_end_idx]
+                    
+                    prev_start = person.prev_pose_landmarks[curr_start_idx]
+                    prev_end = person.prev_pose_landmarks[curr_end_idx]
+                    
+                    # Calculate midpoint of limb
+                    curr_mid = ((curr_start[0] + curr_end[0])/2, (curr_start[1] + curr_end[1])/2)
+                    prev_mid = ((prev_start[0] + prev_end[0])/2, (prev_start[1] + prev_end[1])/2)
+                    
+                    # Calculate speed
+                    limb_speed = self.calculate_speed(curr_mid, prev_mid, time_diff)
+                    
+                    # Calculate relative speed (compared to body center)
+                    relative_speed = limb_speed - body_speed
+                    
+                    limb_speeds[limb_name] = relative_speed
+        
+        # Add hand speeds if available
+        left_hand_pos = person.left_hand.wrist if person.left_hand else None
+        right_hand_pos = person.right_hand.wrist if person.right_hand else None
+        
+        if left_hand_pos and person.prev_left_hand:
+            left_hand_speed = self.calculate_speed(left_hand_pos, person.prev_left_hand, time_diff)
+            limb_speeds["left_hand"] = left_hand_speed - body_speed  # Relative to body
+            
+        if right_hand_pos and person.prev_right_hand:
+            right_hand_speed = self.calculate_speed(right_hand_pos, person.prev_right_hand, time_diff)
+            limb_speeds["right_hand"] = right_hand_speed - body_speed  # Relative to body
+            
+        return limb_speeds
+    
     def detect_interactions(self, persons):
         """Detect interactions between persons based on proximity and speed"""
         current_time = time.time()
@@ -314,90 +465,145 @@ class AssaultDetector:
                 else:
                     continue
             
+            # Calculate limb speeds relative to body
+            person.limb_speeds = self.calculate_body_part_speeds(person)
+            
             # Skip if not enough speed data
-            if not person.prev_left_hand or not person.prev_right_hand or not person.prev_timestamp:
+            if not person.limb_speeds:
                 continue
+                
+            # Check for high-speed body parts 
+            has_high_speed_part = False
+            fastest_part = "None"
+            max_speed = 0
             
-            # Get current hand positions
-            left_hand_pos = person.left_hand.wrist if person.left_hand else None
-            right_hand_pos = person.right_hand.wrist if person.right_hand else None
-            
-            # Time difference
-            time_diff = person.timestamp - person.prev_timestamp
-            if time_diff <= 0:
-                continue
-            
-            # Calculate hand speeds
-            left_speed = self.calculate_speed(left_hand_pos, person.prev_left_hand, time_diff) if left_hand_pos else 0
-            right_speed = self.calculate_speed(right_hand_pos, person.prev_right_hand, time_diff) if right_hand_pos else 0
-            
-            # Calculate body speed (based on center point)
-            center = person.get_center()
-            body_speed = self.calculate_speed(center, person.prev_center, time_diff) if person.prev_center else 0
-            
-            # Update speed values
-            person.left_hand_speed.value = left_speed
-            person.right_hand_speed.value = right_speed
-            person.body_speed.value = body_speed
-            
-            # Check for high-speed movements (relative to body movement)
-            left_hand_relative_speed = left_speed - body_speed
-            right_hand_relative_speed = right_speed - body_speed
-            
-            # Flag for high speed
-            high_speed_threshold = self.speed_threshold
-            person.left_hand_speed.is_high_speed = left_hand_relative_speed > high_speed_threshold
-            person.right_hand_speed.is_high_speed = right_hand_relative_speed > high_speed_threshold
+            for part_name, speed in person.limb_speeds.items():
+                if speed > self.speed_threshold:
+                    has_high_speed_part = True
+                    if speed > max_speed:
+                        max_speed = speed
+                        fastest_part = part_name
             
             # Check for potential assaulter
-            if person.left_hand_speed.is_high_speed or person.right_hand_speed.is_high_speed:
+            if has_high_speed_part:
                 person.is_assaulter = True
-                person.flagged_body_part = "Left Hand" if left_hand_relative_speed > right_hand_relative_speed else "Right Hand"
-                person.assault_confidence = max(left_hand_relative_speed, right_hand_relative_speed) / (high_speed_threshold * 2)
+                person.flagged_body_part = fastest_part
+                person.assault_confidence = max_speed / (self.speed_threshold * 2)
                 person.assault_confidence = min(max(person.assault_confidence, 0.0), 1.0)  # Clamp to [0,1]
                 person.status_start_time = current_time  # Start the persistence timer
                 
-                # Check if any high-speed hand is close to another person (potential victim)
+                # Check if high-speed body part is close to another person (potential victim)
                 for other_id, other_person in persons.items():
                     if other_id == person_id:
                         continue
                     
                     other_center = other_person.get_center()
                     
-                    # Check left hand proximity
-                    if person.left_hand_speed.is_high_speed and left_hand_pos:
-                        distance = self.calculate_distance(left_hand_pos, other_center)
-                        if distance < self.interaction_threshold:
-                            other_person.is_victim = True
-                            other_person.status_start_time = current_time  # Start the persistence timer
-                            self.assault_detected = True
-                            self.last_detection_time = current_time
+                    # Get position of flagged body part (approximate)
+                    flagged_part_position = None
                     
-                    # Check right hand proximity
-                    if person.right_hand_speed.is_high_speed and right_hand_pos:
-                        distance = self.calculate_distance(right_hand_pos, other_center)
+                    if fastest_part == "left_hand" and person.left_hand:
+                        flagged_part_position = person.left_hand.wrist
+                    elif fastest_part == "right_hand" and person.right_hand:
+                        flagged_part_position = person.right_hand.wrist
+                    elif person.pose_landmarks:
+                        # For other body parts, use pose landmarks
+                        if fastest_part == "left_arm" and len(person.pose_landmarks) > 5:
+                            # Left wrist is usually index 5
+                            flagged_part_position = person.pose_landmarks[5]
+                        elif fastest_part == "right_arm" and len(person.pose_landmarks) > 6:
+                            # Right wrist is usually index 6
+                            flagged_part_position = person.pose_landmarks[6]
+                        elif fastest_part == "left_leg" and len(person.pose_landmarks) > 11:
+                            # Left ankle is usually index 11
+                            flagged_part_position = person.pose_landmarks[11]
+                        elif fastest_part == "right_leg" and len(person.pose_landmarks) > 12:
+                            # Right ankle is usually index 12
+                            flagged_part_position = person.pose_landmarks[12]
+                    
+                    # Check proximity
+                    if flagged_part_position:
+                        distance = self.calculate_distance(flagged_part_position, other_center)
                         if distance < self.interaction_threshold:
                             other_person.is_victim = True
                             other_person.status_start_time = current_time  # Start the persistence timer
                             self.assault_detected = True
                             self.last_detection_time = current_time
+
+    def prepare_action_sequence(self, history):
+        """Prepare pose sequence for action recognition model"""
+        if len(history) < self.sequence_length:
+            return None  # Not enough frames
+
+        # Use only the last sequence_length frames
+        recent_history = list(history)[-self.sequence_length:]
+
+        sequence = []
+        for frame_landmarks in recent_history:
+            if not frame_landmarks:
+                return None   # Invalid frame
+                
+            # Ensure we have exactly 33 landmarks (MediaPipe pose default)
+            if len(frame_landmarks) != 33:
+                return None   # Incorrect landmark count
+
+            # Flatten x, y, z coordinates
+            flat = []
+            for point in frame_landmarks:
+                if isinstance(point, tuple) or isinstance(point, list):
+                    if len(point) >= 3:  # (x, y, z)
+                        flat.extend([point[0], point[1], point[2]])
+                    elif len(point) == 2:  # (x, y)
+                        flat.extend([point[0], point[1], 0.0])
+                    else:
+                        return None  # Invalid point format
+                else:
+                    return None  # Invalid point format
+            sequence.append(flat)  # Shape: (10, 99)
+        
+        # Convert to numpy array with proper shape
+        try:
+            return np.array([sequence], dtype=np.float32)  # Shape: (1, 10, 99)
+        except ValueError:
+            return None  # Something went wrong with the conversion
     
     def process_frame(self, frame):
         """Process frame to detect persons with landmarks and detect potential assault"""
-        # Update frame timing
+        # Update frame timing - adjust for consistent delay
         self.prev_frame_time = self.curr_frame_time
         self.curr_frame_time = time.time()
-        fps = 1 / (self.curr_frame_time - self.prev_frame_time) if (self.curr_frame_time - self.prev_frame_time) > 0 else 0
+        
+        # Check if frame is valid
+        if frame is None or frame.size == 0:
+            print("Warning: Empty frame received")
+            return np.zeros((720, 1280, 3), dtype=np.uint8)  # Increased resolution
+        
+        # Resize large frames for better performance
+        frame_height, frame_width = frame.shape[:2]
+        scaling_factor = 1.0
+        
+        if frame_width > 1920:  # Increased from 1280
+            scaling_factor = 1920 / frame_width
+            frame = cv2.resize(frame, (0, 0), fx=scaling_factor, fy=scaling_factor)
+        
+        # Account for the 10ms delay when calculating FPS to get more accurate measurements
+        actual_frame_time = self.curr_frame_time - self.prev_frame_time
+        adjusted_time = max(actual_frame_time, 0.01)  # Ensure minimum 10ms (0.01s)
+        fps = 1 / adjusted_time
         
         # Detect persons using YOLOv8
-        yolo_results = self.yolo_model(frame, conf=self.conf_threshold, classes=[0])  # 0 is person class
-        
-        # Get person bounding boxes
-        person_boxes = []
-        for result in yolo_results:
-            for box in result.boxes.xyxy.cpu().numpy():
-                x1, y1, x2, y2 = map(int, box[:4])
-                person_boxes.append([x1, y1, x2, y2])
+        try:
+            yolo_results = self.yolo_model(frame, conf=self.conf_threshold, classes=[0])  # 0 is person class
+            
+            # Get person bounding boxes
+            person_boxes = []
+            for result in yolo_results:
+                for box in result.boxes.xyxy.cpu().numpy():
+                    x1, y1, x2, y2 = map(int, box[:4])
+                    person_boxes.append([x1, y1, x2, y2])
+        except Exception as e:
+            print(f"Error in YOLO detection: {e}")
+            person_boxes = []
       
         # Make a copy for drawing
         annotated_frame = frame.copy()
@@ -422,6 +628,9 @@ class AssaultDetector:
                 person.prev_center = person.get_center()
                 person.prev_left_hand = person.left_hand.wrist if person.left_hand else None
                 person.prev_right_hand = person.right_hand.wrist if person.right_hand else None
+                person.prev_pose_landmarks = person.pose_landmarks  # Store previous pose landmarks
+                # Reset missing frames counter
+                person.missing_frames = 0
                 # Update box
                 person.box = box
             else:
@@ -447,280 +656,345 @@ class AssaultDetector:
             rgb_roi = cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB)
             
             # Process with MediaPipe
-            results = self.holistic.process(rgb_roi)
+            try:
+                results = self.holistic.process(rgb_roi)
+            except Exception as e:
+                print(f"Error in MediaPipe processing: {e}")
+                continue
             
             # Draw bounding box with ID
             box_color = (0, 255, 0)  # Default color (green)
             if person.is_assaulter:
-                box_color = (0, 0, 255)  # Red for assaulter
+                box_color = (0, 0, 255)  # Red for assaulter (BGR format)
             elif person.is_victim:
-                box_color = (255, 0, 0)  # Orange for victim
+                box_color = (255, 0, 0)  # Blue for victim (BGR format)
                 
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 2)
             cv2.putText(annotated_frame, f"ID: {person_id}", (x1, y1 - 10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
             
             # Scale factors for mapping back to original frame
-            scale_x = (x2 - x1) / person_roi.shape[1]
-            scale_y = (y2 - y1) / person_roi.shape[0]
+            # Scale factors for mapping back to original frame
+            scale_x = frame_width / person_roi.shape[1]
+            scale_y = frame_height / person_roi.shape[0]
+            
+            offset_x, offset_y = x1, y1
             
             # Process pose landmarks
             if results.pose_landmarks:
-                pose_points = []
-                
-                # Draw selected pose landmarks
+                # Extract selected pose landmarks
+                pose_landmarks = []
                 for idx in self.selected_pose_keypoints:
-                    landmark = results.pose_landmarks.landmark[idx]
-                    # Map coordinates back to original frame
-                    px = int(landmark.x * person_roi.shape[1] * scale_x) + x1
-                    py = int(landmark.y * person_roi.shape[0] * scale_y) + y1
-                    pose_points.append((px, py))
-                    cv2.circle(annotated_frame, (px, py), 5, (0, 255, 255), -1)
+                    lm = results.pose_landmarks.landmark[idx]
+                    # Scale to ROI size, then add offset to map back to full frame
+                    x = lm.x * (x2 - x1) + offset_x
+                    y = lm.y * (y2 - y1) + offset_y
+                    z = lm.z
+                    pose_landmarks.append((x, y, z))
                 
-                # Connect landmarks with lines
-                connections = [
-                    (0, 1), (0, 2),  # Nose to shoulders
-                    (1, 3), (3, 5),  # Left arm
-                    (2, 4), (4, 6),  # Right arm
-                    (1, 7), (2, 8),  # Shoulders to hips
-                    (7, 9), (9, 11),  # Left leg
-                    (8, 10), (10, 12)  # Right leg
-                ]
+                person.pose_landmarks = pose_landmarks
                 
-                for connection in connections:
-                    if connection[0] < len(pose_points) and connection[1] < len(pose_points):
-                        cv2.line(annotated_frame, 
-                                pose_points[connection[0]], 
-                                pose_points[connection[1]], 
-                                (0, 255, 0), 2)
+                # Append to pose history for action recognition
+                if len(pose_landmarks) == len(self.selected_pose_keypoints):
+                    full_pose = []
+                    # Create full 33-point pose estimation (needed for action model)
+                    for i in range(33):  # MediaPipe provides 33 pose landmarks
+                        if i in self.selected_pose_keypoints:
+                            idx = self.selected_pose_keypoints.index(i)
+                            full_pose.append(pose_landmarks[idx])
+                        else:
+                            # For missing landmarks, use zeros or interpolate
+                            full_pose.append((0.0, 0.0, 0.0))
+                            
+                    person.pose_history.append(full_pose)
+                    
+                    # Keep only the most recent frames based on sequence_length
+                    if len(person.pose_history) > self.sequence_length * 2:
+                        person.pose_history = deque(list(person.pose_history)[-self.sequence_length*2:], 
+                                                  maxlen=self.sequence_length*2)
                 
-                person.pose_landmarks = pose_points
+                # Draw pose landmarks on the annotated frame
+                for i, (x, y, _) in enumerate(pose_landmarks):
+                    cv2.circle(annotated_frame, (int(x), int(y)), 4, (0, 255, 0), -1)
+                    
+                    # Connect landmarks to show skeleton (simplified)
+                    if i > 0 and i < len(pose_landmarks) - 1:
+                        prev_point = (int(pose_landmarks[i-1][0]), int(pose_landmarks[i-1][1]))
+                        curr_point = (int(x), int(y))
+                        cv2.line(annotated_frame, prev_point, curr_point, (0, 255, 0), 2)
             
             # Process left hand landmarks
             if results.left_hand_landmarks:
-                left_hand = self._extract_simplified_hand_landmarks(results.left_hand_landmarks)
+                person.left_hand = self._extract_simplified_hand_landmarks(results.left_hand_landmarks)
+                person.left_gesture = self.detect_gesture(person.left_hand)
                 
-                # Map simplified landmarks to original frame
-                if left_hand:
-                    points = []
-                    for point_name in ["wrist", "thumb_tip", "index_base", "index_tip", 
-                                     "middle_tip", "ring_tip", "pinky_tip"]:
-                        point = getattr(left_hand, point_name)
-                        px = int(point[0] * person_roi.shape[1] * scale_x) + x1
-                        py = int(point[1] * person_roi.shape[0] * scale_y) + y1
-                        points.append((px, py))
+                # Store in history
+                if person.left_hand:
+                    person.left_hand_history.append(person.left_hand.wrist)
                     
-                    # Determine hand color based on speed
-                    hand_color = (255, 0, 0)  # Default blue
-                    if person.left_hand_speed.is_high_speed:
-                        hand_color = (0, 0, 255)  # Red for high speed
-                    
-                    # Draw simplified hand landmarks
-                    for point in points:
-                        cv2.circle(annotated_frame, point, 5, hand_color, -1)
-                    
-                    # Connect points with lines for better visualization
-                    connections = [(0, 1), (0, 2), (2, 3), (0, 4), (0, 5), (0, 6)]
-                    for connection in connections:
-                        cv2.line(annotated_frame, points[connection[0]], 
-                               points[connection[1]], hand_color, 2)
-                    
-                    # Detect gesture and display
-                    person.left_gesture = self.detect_gesture(left_hand)
-                    
-                    # Display speed
-                    if person.left_hand_speed.value > 0:
-                        speed_text = f"L: {person.left_hand_speed.value:.1f} px/s"
-                        cv2.putText(annotated_frame, speed_text, 
-                                  (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                                  0.6, hand_color, 2)
-                    
-                    # Store mapped hand landmarks
-                    remapped_hand = SimplifiedHandLandmarks(
-                        wrist=points[0],
-                        thumb_tip=points[1],
-                        index_base=points[2],
-                        index_tip=points[3],
-                        middle_tip=points[4],
-                        ring_tip=points[5],
-                        pinky_tip=points[6]
-                    )
-                    person.left_hand = remapped_hand
-                    
-                    # Store hand position in history
-                    person.left_hand_history.append(points[0])  # Wrist position
+                # Draw gesture text
+                if person.left_gesture != "None":
+                    gesture_text = f"Left: {person.left_gesture}"
+                    cv2.putText(annotated_frame, gesture_text, (x1, y2 + 15), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
             
             # Process right hand landmarks
             if results.right_hand_landmarks:
-                right_hand = self._extract_simplified_hand_landmarks(results.right_hand_landmarks)
+                person.right_hand = self._extract_simplified_hand_landmarks(results.right_hand_landmarks)
+                person.right_gesture = self.detect_gesture(person.right_hand)
                 
-                # Map simplified landmarks to original frame
-                if right_hand:
-                    points = []
-                    for point_name in ["wrist", "thumb_tip", "index_base", "index_tip", 
-                                     "middle_tip", "ring_tip", "pinky_tip"]:
-                        point = getattr(right_hand, point_name)
-                        px = int(point[0] * person_roi.shape[1] * scale_x) + x1
-                        py = int(point[1] * person_roi.shape[0] * scale_y) + y1
-                        points.append((px, py))
+                # Store in history
+                if person.right_hand:
+                    person.right_hand_history.append(person.right_hand.wrist)
                     
-                    # Determine hand color based on speed
-                    hand_color = (0, 0, 255)  # Default red
-                    if person.right_hand_speed.is_high_speed:
-                        hand_color = (255, 0, 0)  # Blue for high speed
-                    
-                    # Draw simplified hand landmarks
-                    for point in points:
-                        cv2.circle(annotated_frame, point, 5, hand_color, -1)
-                    
-                    # Connect points with lines for better visualization
-                    connections = [(0, 1), (0, 2), (2, 3), (0, 4), (0, 5), (0, 6)]
-                    for connection in connections:
-                        cv2.line(annotated_frame, points[connection[0]], 
-                               points[connection[1]], hand_color, 2)
-                    
-                    # Detect gesture and display
-                    person.right_gesture = self.detect_gesture(right_hand)
-                    
-                    # Display speed
-                    if person.right_hand_speed.value > 0:
-                        speed_text = f"R: {person.right_hand_speed.value:.1f} px/s"
-                        text_x = min(x1 + 100, frame.shape[1] - 100)
-                        cv2.putText(annotated_frame, speed_text, 
-                                  (text_x, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                                  0.6, hand_color, 2)
-                    
-                    # Store mapped hand landmarks
-                    remapped_hand = SimplifiedHandLandmarks(
-                        wrist=points[0],
-                        thumb_tip=points[1],
-                        index_base=points[2],
-                        index_tip=points[3],
-                        middle_tip=points[4],
-                        ring_tip=points[5],
-                        pinky_tip=points[6]
-                    )
-                    person.right_hand = remapped_hand
-                    
-                    # Store hand position in history
-                    person.right_hand_history.append(points[0])  # Wrist position
+                # Draw gesture text
+                if person.right_gesture != "None":
+                    gesture_text = f"Right: {person.right_gesture}"
+                    cv2.putText(annotated_frame, gesture_text, (x1, y2 + 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
             
-            # Add person data to current frame's dictionary
+            # Store center position in history
+            person.center_history.append(person.get_center())
+            
+            # Run action recognition model if available and enough pose history
+            if self.action_model_loaded and len(person.pose_history) >= self.sequence_length:
+                try:
+                    # Check if any body part is moving fast enough compared to the rest of the body
+                    body_part_speeds = self.calculate_body_part_speeds(person)
+                    fast_body_part = False
+                    
+                    for part_name, speed in body_part_speeds.items():
+                        # Check if body part speed exceeds threshold (100 px/s)
+                        if speed > 100:  # Increased from original threshold
+                            fast_body_part = True
+                            break
+                    
+                    # Only run action recognition if a body part is moving fast
+                    if fast_body_part:
+                        # Prepare sequence for action recognition
+                        sequence = self.prepare_action_sequence(person.pose_history)
+                        
+                        if sequence is not None:
+                            # Make prediction
+                            prediction = self.action_model.predict(sequence, verbose=0)
+                            
+                            # Get predicted class and confidence
+                            predicted_class_idx = np.argmax(prediction[0])
+                            confidence = prediction[0][predicted_class_idx]
+                            
+                            # Update person's detected action if confidence is high enough
+                            if confidence > self.action_threshold:
+                                person.detected_action = self.action_classes[predicted_class_idx]
+                                person.action_confidence = float(confidence)
+                                
+                                # If detected action is assault-related, flag as assaulter
+                                assault_actions = ["Punch", "Kick", "Push", "Slap"]
+                                if person.detected_action in assault_actions:
+                                    person.is_assaulter = True
+                                    person.flagged_body_part = "Action: " + person.detected_action
+                                    person.assault_confidence = confidence
+                                    person.status_start_time = time.time()  # Reset the 10-second timer
+                                    
+                                    # Set assault detected flag
+                                    self.assault_detected = True
+                                    self.last_detection_time = time.time()
+                                    
+                                    # Look for potential victims (closest person)
+                                    min_distance = float('inf')
+                                    closest_person_id = None
+                                    
+                                    for other_id, other_person in current_persons.items():
+                                        if other_id != person_id:
+                                            other_center = other_person.get_center()
+                                            distance = self.calculate_distance(person.get_center(), other_center)
+                                            
+                                            if distance < min_distance and distance < self.interaction_threshold * 3:
+                                                min_distance = distance
+                                                closest_person_id = other_id
+                                    
+                                    # Mark closest person as victim
+                                    if closest_person_id is not None and closest_person_id in current_persons:
+                                        victim = current_persons[closest_person_id]
+                                        victim.is_victim = True
+                                        victim.status_start_time = time.time()  # Reset the 10-second timer
+                
+                except Exception as e:
+                    print(f"Error in action recognition: {e}")
+            
+            # Draw action text if an action was detected
+            if person.detected_action != "None":
+                action_text = f"{person.detected_action}: {person.action_confidence:.2f}"
+                cv2.putText(annotated_frame, action_text, (x1, y2 + 45), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            
+            # Store updated person data
             current_persons[person_id] = person
-            
-            # Add flags and text for assaulter/victim
-            status_y = y1 - 50
-            if person.is_assaulter:
-                # Calculate remaining time
-                time_left = self.status_persistence - (time.time() - person.status_start_time)
-                time_left = max(0, time_left)
-                
-                cv2.putText(annotated_frame, f"ASSAULTER ({person.flagged_body_part}) [{time_left:.1f}s]", 
-                          (x1, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                # Show confidence level
-                conf_text = f"Conf: {person.assault_confidence:.2f}"
-                cv2.putText(annotated_frame, conf_text, 
-                          (x1, status_y - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            
-            elif person.is_victim:
-                # Calculate remaining time
-                time_left = self.status_persistence - (time.time() - person.status_start_time)
-                time_left = max(0, time_left)
-                
-                cv2.putText(annotated_frame, f"VICTIM [{time_left:.1f}s]", 
-                          (x1, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
         
-        # Detect interactions between persons
-        self.detect_interactions(current_persons)
+        # Update tracked persons with current persons
+        self.tracked_persons = current_persons.copy()
         
-        # Update tracked persons
-        self.tracked_persons = current_persons
-        
-        # Check if assault alert should be displayed
-        if self.assault_detected:
-            if time.time() - self.last_detection_time < self.alert_duration:
-                # Draw warning on frame
-                cv2.putText(annotated_frame, "⚠️ ASSAULT DETECTED ⚠️", 
-                          (int(frame.shape[1]/2) - 200, 50), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-            else:
-                self.assault_detected = False
-        
-        # Display FPS
-        cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Display person count
-        cv2.putText(annotated_frame, f"Persons: {len(current_persons)}", 
-                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Display speed threshold
-        cv2.putText(annotated_frame, f"Speed Threshold: {self.speed_threshold} px/s", 
-                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Check for expired flags in tracked persons
-        current_time = time.time()
-        for person_id, person in list(self.tracked_persons.items()):
-            # If person is not in current frame
+        # Process missing persons
+        for person_id in list(self.tracked_persons.keys()):
             if person_id not in current_persons:
-                # If person was flagged, store in flagged_people
-                if person.is_assaulter or person.is_victim:
-                    # Only add if not already expired
-                    if person.status_start_time > 0 and current_time - person.status_start_time < self.status_persistence:
-                        self.flagged_people[person_id] = person
-                # Remove from tracked persons
-                del self.tracked_persons[person_id]
-        
-        # Process flagged people who are no longer in frame
-        for person_id, person in list(self.flagged_people.items()):
-            # Check if flag should expire
-            if current_time - person.status_start_time > self.status_persistence:
-                del self.flagged_people[person_id]
-            # Check if person reappeared in current frame
-            elif person_id in current_persons:
-                # Transfer flag status to current person
-                current_persons[person_id].is_assaulter = person.is_assaulter
-                current_persons[person_id].is_victim = person.is_victim
-                current_persons[person_id].flagged_body_part = person.flagged_body_part
-                current_persons[person_id].assault_confidence = person.assault_confidence
-                current_persons[person_id].status_start_time = person.status_start_time
-                # Remove from flagged people
-                del self.flagged_people[person_id]
+                self.tracked_persons[person_id].missing_frames += 1
                 
-        return annotated_frame
-
-    def run_detection(self, video_source=0):
-        """Run assault detection on video source"""
-        cap = cv2.VideoCapture(video_source)
+                # Remove person if missing for too many frames
+                if self.tracked_persons[person_id].missing_frames > 30:  # Increased from default
+                    # If this person was flagged, store them in flagged_people
+                    if self.tracked_persons[person_id].is_assaulter or self.tracked_persons[person_id].is_victim:
+                        self.flagged_people[person_id] = {
+                            "status": "assaulter" if self.tracked_persons[person_id].is_assaulter else "victim",
+                            "time": time.time()
+                        }
+                    
+                    # Remove from tracking
+                    del self.tracked_persons[person_id]
         
-        while cap.isOpened():
+        # Calculate additional metrics for interaction detection
+        self.detect_interactions(self.tracked_persons)
+        
+        # Check if we should show assault alert
+        if self.assault_detected and time.time() - self.last_detection_time < self.alert_duration:
+            cv2.putText(annotated_frame, "ASSAULT DETECTED!", (50, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+        else:
+            self.assault_detected = False
+        
+        # Print stats
+        cv2.putText(annotated_frame, f"FPS: {fps:.2f}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, f"People: {len(self.tracked_persons)}", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        # Draw legend
+        cv2.putText(annotated_frame, "Green: Normal", (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, "Red: Assaulter", (10, 120), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(annotated_frame, "Blue: Victim", (10, 150), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        
+        return annotated_frame
+    
+    def release(self):
+        """Release resources"""
+        self.holistic.close()
+
+
+def main():
+    """Main function to run assault detection on video"""
+    # Parse command line arguments
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Run assault detection on video')
+    parser.add_argument('--input', type=str, default='0', help='Input video file or camera index (default: 0)')
+    parser.add_argument('--output', type=str, default='output.mp4', help='Output video file (default: output.mp4)')
+    parser.add_argument('--yolo-size', type=str, default='n', help='YOLOv8 model size (n, s, m, l, x) (default: n)')
+    parser.add_argument('--conf', type=float, default=0.5, help='Confidence threshold (default: 0.5)')
+    parser.add_argument('--speed-threshold', type=float, default=100, help='Speed threshold for assault detection (default: 100)')
+    parser.add_argument('--interaction-distance', type=float, default=150, help='Distance threshold for interaction detection (default: 150)')
+    parser.add_argument('--model', type=str, default=None, help='Path to action recognition model file')
+    parser.add_argument('--output-size', type=str, default='1920x1080', help='Output video size (default: 1920x1080)')
+    parser.add_argument('--max-frames', type=int, default=30, help='Maximum frames to process (default: 30)')
+    
+    args = parser.parse_args()
+    
+    # Parse input source
+    if args.input.isdigit():
+        input_source = int(args.input)
+    else:
+        input_source = args.input
+    
+    # Parse output size
+    width, height = map(int, args.output_size.split('x'))
+    
+    # Initialize video capture
+    cap = cv2.VideoCapture(input_source)
+    if not cap.isOpened():
+        print(f"Error: Could not open video source {args.input}")
+        return
+    
+    # Set capture resolution higher if it's a camera
+    if isinstance(input_source, int):
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    
+    # Get video properties
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if fps <= 0:
+        fps = 30  # Default FPS if not available
+    
+    # Initialize detector
+    detector = AssaultDetector(
+        yolo_model_size=args.yolo_size,
+        min_detection_confidence=args.conf,
+        speed_threshold=args.speed_threshold,
+        interaction_threshold=args.interaction_distance,
+        action_model_path=args.model,
+        action_threshold=0.65
+    )
+    
+    # Update max frames to process
+    detector.max_frames_to_process = args.max_frames
+    
+    # Initialize video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
+    
+    print(f"Processing video with output size {width}x{height} at {fps} FPS")
+    print(f"Using YOLOv8{args.yolo_size} model with confidence threshold {args.conf}")
+    print(f"Speed threshold: {args.speed_threshold}, Interaction distance: {args.interaction_distance}")
+    print(f"Action model: {args.model if args.model else 'Auto-detected'}")
+    print(f"Max frames to process: {args.max_frames}")
+    
+    try:
+        start_time = time.time()
+        frame_count = 0
+        
+        while True:
+            # Read frame
             ret, frame = cap.read()
             if not ret:
                 break
-                
-            # Process frame
-            result_frame = self.process_frame(frame)
             
-            # Display result
-            cv2.imshow('Assault Detection', result_frame)
+            # Process frame
+            processed_frame = detector.process_frame(frame)
+            
+            # Resize processed frame to desired output size
+            processed_frame = cv2.resize(processed_frame, (width, height))
+            
+            # Write frame to output
+            out.write(processed_frame)
+            
+            # Display frame
+            cv2.imshow('Assault Detection', processed_frame)
             
             # Exit on ESC key
             if cv2.waitKey(1) == 27:
                 break
-                
+            
+            frame_count += 1
+        
+        # Print stats
+        elapsed_time = time.time() - start_time
+        print(f"Processed {frame_count} frames in {elapsed_time:.2f} seconds ({frame_count/elapsed_time:.2f} FPS)")
+    
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+    
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    finally:
+        # Release resources
         cap.release()
+        out.release()
         cv2.destroyAllWindows()
+        detector.release()
+        print(f"Output saved to {args.output}")
+
 
 if __name__ == "__main__":
-    # Initialize detector with default settings
-    detector = AssaultDetector(
-        yolo_model_size="n",
-        min_detection_confidence=0.5,
-        speed_threshold=100,
-        interaction_threshold=50
-    )
-    
-    # Run detection on webcam (0) or video file
-    detector.run_detection(0)  # Use webcam
-    # Alternative: detector.run_detection("path/to/video.mp4")  # Use video file
+    main()
